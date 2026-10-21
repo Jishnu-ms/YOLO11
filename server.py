@@ -100,11 +100,13 @@ async def predict(file: UploadFile = File(...)):
 
     try:
         results = model.predict(
-            source=image,
-            imgsz=640,
-            conf=0.25,
-            verbose=False,
-        )
+        source=image,
+        imgsz=416,
+        conf=0.35,
+        max_det=100,
+        device="cpu",
+        verbose=False,
+)
     except Exception as exc:
         raise HTTPException(
             status_code=500,
