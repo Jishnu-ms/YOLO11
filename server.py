@@ -1,3 +1,4 @@
+
 from pathlib import Path
 from io import BytesIO
 import base64
@@ -11,19 +12,30 @@ from fastapi.responses import StreamingResponse
 from ultralytics import YOLO
 
 
+# --------------------------------------------------
+# Configuration
+# --------------------------------------------------
+
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_PATH = BASE_DIR / "models" / "best.pt"
 
-if not MODEL_PATH.exists():
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+ALLOWED_TYPES = {"image/jpeg", "image/png", "image/webp"}
+
+if not MODEL_PATH.is_file():
     raise FileNotFoundError(f"YOLO model not found: {MODEL_PATH}")
+
+
+# --------------------------------------------------
+# FastAPI application
+# --------------------------------------------------
 
 app = FastAPI(
     title="Water Pollution YOLO Detection API",
     description="Detect floating waste in uploaded images.",
-    version="1.0.0",
+    version="1.1.0",
 )
 
-# Development configuration. Restrict origins before production deployment.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -32,11 +44,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# Load the model once during startup/import
 model = YOLO(str(MODEL_PATH))
 
-MAX_IMAGE_BYTES = 10 * 1024 * 1024
-ALLOWED_TYPES = {"image/jpeg", "image/png", "image/webp"}
 
+# --------------------------------------------------
+# Basic endpoints
+# --------------------------------------------------
 
 @app.get("/")
 def root():
@@ -44,6 +59,7 @@ def root():
         "service": "Water Pollution YOLO Detection API",
         "status": "running",
         "model": MODEL_PATH.name,
+        "device": "cpu",
         "docs": "/docs",
     }
 
@@ -59,17 +75,19 @@ def health():
 
 @app.get("/classes")
 def classes():
-    names = model.names
     return {
         "classes": [
             {"id": int(class_id), "name": str(name)}
-            for class_id, name in names.items()
+            for class_id, name in model.names.items()
         ]
     }
 
 
-@app.post("/predict")
-async def predict(file: UploadFile = File(...)):
+# --------------------------------------------------
+# Shared prediction helper
+# --------------------------------------------------
+
+async def run_prediction(file: UploadFile):
     if file.content_type not in ALLOWED_TYPES:
         raise HTTPException(
             status_code=415,
@@ -79,7 +97,10 @@ async def predict(file: UploadFile = File(...)):
     raw = await file.read(MAX_IMAGE_BYTES + 1)
 
     if not raw:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+        raise HTTPException(
+            status_code=400,
+            detail="Uploaded file is empty.",
+        )
 
     if len(raw) > MAX_IMAGE_BYTES:
         raise HTTPException(
@@ -100,20 +121,25 @@ async def predict(file: UploadFile = File(...)):
 
     try:
         results = model.predict(
-        source=image,
-        imgsz=416,
-        conf=0.35,
-        max_det=100,
-        device="cpu",
-        verbose=False,
-)
+            source=image,
+            imgsz=416,
+            conf=0.35,
+            max_det=100,
+            device="cpu",
+            verbose=False,
+        )
     except Exception as exc:
+        # Log the exception server-side; avoid exposing internal details.
+        print(f"YOLO inference failed: {type(exc).__name__}: {exc}")
         raise HTTPException(
             status_code=500,
-            detail=f"Model inference failed: {str(exc)}",
+            detail="Model inference failed. Check server logs.",
         ) from exc
 
-    elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
+    elapsed_ms = round(
+        (time.perf_counter() - start) * 1000, 2
+    )
+
     result = results[0]
     detections = []
 
@@ -136,17 +162,18 @@ async def predict(file: UploadFile = File(...)):
             })
 
     annotated = result.plot()
-    success, encoded_image = cv2.imencode(".jpg", annotated)
+
+    success, encoded_image = cv2.imencode(
+        ".jpg",
+        annotated,
+        [cv2.IMWRITE_JPEG_QUALITY, 85],
+    )
 
     if not success:
         raise HTTPException(
             status_code=500,
             detail="Could not encode annotated image.",
         )
-
-    annotated_base64 = base64.b64encode(
-        encoded_image.tobytes()
-    ).decode("ascii")
 
     return {
         "success": True,
@@ -156,22 +183,45 @@ async def predict(file: UploadFile = File(...)):
         "inference_time_ms": elapsed_ms,
         "detection_count": len(detections),
         "detections": detections,
-        "annotated_image_base64": annotated_base64,
+        "annotated_image_base64": base64.b64encode(
+            encoded_image.tobytes()
+        ).decode("ascii"),
     }
+
+
+# --------------------------------------------------
+# Prediction endpoints
+# --------------------------------------------------
+
+@app.post("/predict")
+async def predict(file: UploadFile = File(...)):
+    try:
+        return await run_prediction(file)
+    finally:
+        await file.close()
 
 
 @app.post("/predict/annotated")
 async def predict_annotated(file: UploadFile = File(...)):
-    """Return only the annotated JPEG image."""
-    response = await predict(file)
+    try:
+        response = await run_prediction(file)
 
-    image_bytes = base64.b64decode(response["annotated_image_base64"])
+        image_bytes = base64.b64decode(
+            response["annotated_image_base64"]
+        )
 
-    return StreamingResponse(
-        BytesIO(image_bytes),
-        media_type="image/jpeg",
-        headers={
-            "X-Detection-Count": str(response["detection_count"]),
-            "X-Inference-Time-Ms": str(response["inference_time_ms"]),
-        },
-    )
+        return StreamingResponse(
+            BytesIO(image_bytes),
+            media_type="image/jpeg",
+            headers={
+                "X-Detection-Count": str(
+                    response["detection_count"]
+                ),
+                "X-Inference-Time-Ms": str(
+                    response["inference_time_ms"]
+                ),
+            },
+        )
+    finally:
+        await file.close()
+
