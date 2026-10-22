@@ -224,4 +224,3 @@ async def predict_annotated(file: UploadFile = File(...)):
         )
     finally:
         await file.close()
-
